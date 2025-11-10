@@ -53,7 +53,7 @@ program tb_prog_c (
   int unsigned num_instructions;
   logic [7:0] mem[0:255];
 
-  // **NEW**: Handle for our instruction class
+  // Handle for our instruction class
   instruction inst_item;
 
   // forward-declare any ints used later in functions/tasks
@@ -116,10 +116,13 @@ program tb_prog_c (
     end
   endtask
 
-  // The make_random_instr() function is now DELETED.
 
-  // main test sequence (MODIFIED)
+  // main test sequence (CORRECTED)
   task automatic run_tests();
+    // **FIX**: All local variable declarations MUST go at the top of the task.
+    bit [15:0] inst;
+    bit [15:0] halt_instr;
+
     // wait for external reset deassertion
     wait (tb_h.rst_n == 1);
 
@@ -131,7 +134,7 @@ program tb_prog_c (
       mem_model();
     join_none
 
-    // **NEW**: Construct the instruction item
+    // Construct the instruction item
     inst_item = new();
 
     // issue randomized instruction stream until max count
@@ -141,21 +144,20 @@ program tb_prog_c (
 
     for (int i = 0; i < num_instructions; i++) begin
 
-      // **NEW**: Randomize the class object
+      // Randomize the class object
       if (!inst_item.randomize()) begin
         $error("Randomization failed!");
         $finish;
       end
 
-      // **NEW**: Get the 16-bit instruction from the class
-      bit [15:0] inst = inst_item.get_instr();
+      // This is now an assignment, not a declaration.
+      inst = inst_item.get_instr();
 
       // wait until CPU is ready to accept an instruction
-      // **MODIFIED**: Removed '|| tb_h.cb.done' check
       do @(tb_h.cb); while (!tb_h.cb.instr_ready);
 
       // drive instruction and valid for one clock
-      tb_h.cb.instr <= inst;
+      tb_h.cb.instr <= inst;  // Use the local 'inst' variable
       tb_h.cb.instr_valid <= 1'b1;
       @(tb_h.cb);
       tb_h.cb.instr_valid <= 1'b0;
@@ -163,12 +165,9 @@ program tb_prog_c (
       // sample coverage
       cg_op.sample();
       cg_fl.sample();
-
-      // **MODIFIED**: The check for 'done' is removed, as HALT is constrained out.
     end
 
-    // --- **NEW**: Directed HALT test ---
-    // Now that the random test is done, we explicitly test HALT.
+    // --- Directed HALT test ---
     $display("[%0t] Random instructions complete. Sending directed HALT.", $time);
 
     // 1. Turn off the no_halt constraint
@@ -180,11 +179,12 @@ program tb_prog_c (
       $finish;
     end
 
-    bit [15:0] halt_instr = inst_item.get_instr();  // This will be 16'hF...
+    // This is now an assignment, not a declaration.
+    halt_instr = inst_item.get_instr();  // This will be 16'hF...
 
     // 3. Wait and drive the HALT instruction
     do @(tb_h.cb); while (!tb_h.cb.instr_ready);
-    tb_h.cb.instr <= halt_instr;
+    tb_h.cb.instr <= halt_instr;  // Use the local 'halt_instr' variable
     tb_h.cb.instr_valid <= 1'b1;
     @(tb_h.cb);
     tb_h.cb.instr_valid <= 1'b0;
