@@ -51,7 +51,7 @@ program tb_prog_c (
   // local variables (declarations first)
   int unsigned num_instructions;
   logic [7:0] mem[0:255];
-  // **NEW**: Handle for our instruction class
+  // *NEW*: Handle for our instruction class
   instruction inst_item;
   // forward-declare any ints used later in functions/tasks
   // (these will be re-declared locally in functions where needed)
@@ -86,34 +86,49 @@ program tb_prog_c (
   endgroup
   cg_flags cg_fl = new();
 
-  // memory model task (Copied directly from tb_prog.sv)
+  // memory model task (FIXED to prevent race condition)
   task automatic mem_model();
+    logic mem_ready_ff;  // Use a register for synchronous behavior
+
+    // Default state
+    tb_h.cb.mem_ready <= 1'b0;
+    tb_h.cb.mem_rdata <= 8'h00;
+    mem_ready_ff <= 1'b0;
+
     forever begin
-      @(tb_h.cb);
+      @(tb_h.cb);  // Wait for the clock
+
+      // --- Handle Ready Signal ---
+      // Drive the ready signal from our registered value
+      tb_h.cb.mem_ready <= mem_ready_ff;
+      // Default: set ready back to 0 next cycle
+      mem_ready_ff <= 1'b0;
+
+      // --- Handle Request ---
       if (tb_h.cb.mem_req) begin
-        int delay = $urandom_range(0, 1);
-        repeat (delay) @(tb_h.cb);
+        //
+        // CPU request is high. Service it.
+        // We will set mem_ready_ff = 1, so it goes high *next* clock.
+        //
+        mem_ready_ff <= 1'b1;
 
         if (tb_h.cb.mem_we) begin
+          // Write operation
           mem[tb_h.cb.mem_addr] = tb_h.cb.mem_wdata;
-          tb_h.cb.mem_rdata <= 8'h00;
-          tb_h.cb.mem_ready <= 1'b1;
+          tb_h.cb.mem_rdata <= 8'h00;  // Drive 0 on data bus for writes
         end else begin
+          // Read operation
           tb_h.cb.mem_rdata <= mem[tb_h.cb.mem_addr];
-          tb_h.cb.mem_ready <= 1'b1;
         end
 
-        @(tb_h.cb);
-        tb_h.cb.mem_ready <= 1'b0;
-        tb_h.cb.mem_rdata <= 8'h00;
       end else begin
-        tb_h.cb.mem_ready <= 1'b0;
+        // No request, just drive 0
         tb_h.cb.mem_rdata <= 8'h00;
       end
     end
   endtask
 
-  // --- **NEW**: Helper task to drive a single instruction
+  // --- *NEW*: Helper task to drive a single instruction
   task automatic drive_instr(bit [15:0] inst);
     // 1. Wait for CPU to be ready
     do @(tb_h.cb); while (!tb_h.cb.instr_ready);
@@ -129,9 +144,9 @@ program tb_prog_c (
     cg_op.sample();
   endtask
 
-  // --- **NEW**: Helper task to load a register with a specific value
+  // --- *NEW*: Helper task to load a register with a specific value
   // Note: This assumes reg[0] is 0 (which it is at reset)
-  // It uses `LOAD rd, [r0 + addr]`
+  // It uses LOAD rd, [r0 + addr]
   task automatic load_reg_via_mem(int reg_idx, logic [7:0] val, logic [7:0] addr);
     bit [15:0] load_instr;
 
@@ -185,46 +200,38 @@ program tb_prog_c (
       mem_model();
     join_none
 
-    // **NEW**: Construct the instruction item
+    // *NEW*: Construct the instruction item
     inst_item = new();
 
     // -----------------------------------------------------------------
     // 1. RANDOM PHASE
     // -----------------------------------------------------------------
-    num_instructions = 10;
+    num_instructions = 500;
     $display("[%0t] Running %0d random instructions (HALT is constrained)...", $time,
              num_instructions);
 
     for (int i = 0; i < num_instructions; i++) begin
-
-      // Randomize the class object
+      // *NEW*: Randomize the class object
       if (!inst_item.randomize()) begin
         $error("Randomization failed!");
         $finish;
       end
 
-      // This is now an assignment, not a declaration.
-      inst = inst_item.get_instr();
+      // *NEW*: Get the 16-bit instruction from the class
+      //
+      // *** FIX ***: Use assignment, not declaration
+      // bit [15:0] inst = inst_item.get_instr(); <-- OLD (ILLEGAL)
+      inst = inst_item.get_instr();  // <-- NEW (LEGAL)
 
-      // **ADD THIS LINE TO PRINT THE INSTRUCTION**
-      $display("[%0t] Driving instr #%0d: 0x%h (opcode: 0x%h)", $time, i, inst, inst_item.opc);
+      // *NEW*: Use helper task to drive
+      drive_instr(inst);
 
-      // wait until CPU is ready to accept an instruction
-      do @(tb_h.cb); while (!tb_h.cb.instr_ready);
-
-      // drive instruction and valid for one clock
-      tb_h.cb.instr <= inst;  // Use the local 'inst' variable
-      tb_h.cb.instr_valid <= 1'b1;
-      @(tb_h.cb);
-      tb_h.cb.instr_valid <= 1'b0;
-
-      // sample coverage
-      cg_op.sample();
+      // sample coverage (flags)
       cg_fl.sample();
     end
 
     // -----------------------------------------------------------------
-    // 2. **NEW**: DIRECTED FLAG-COVERAGE PHASE
+    // 2. *NEW*: DIRECTED FLAG-COVERAGE PHASE
     // -----------------------------------------------------------------
     $display("[%0t] Random instructions complete. Running directed flag tests...", $time);
 
