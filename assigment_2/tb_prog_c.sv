@@ -48,14 +48,11 @@ endclass
 program tb_prog_c (
     tb_if tb_h
 );
-
   // local variables (declarations first)
   int unsigned num_instructions;
   logic [7:0] mem[0:255];
-
-  // Handle for our instruction class
+  // **NEW**: Handle for our instruction class
   instruction inst_item;
-
   // forward-declare any ints used later in functions/tasks
   // (these will be re-declared locally in functions where needed)
 
@@ -116,90 +113,179 @@ program tb_prog_c (
     end
   endtask
 
+  // --- **NEW**: Helper task to drive a single instruction
+  task automatic drive_instr(bit [15:0] inst);
+    // 1. Wait for CPU to be ready
+    do @(tb_h.cb); while (!tb_h.cb.instr_ready);
+    // 2. Drive instruction for one clock
+    tb_h.cb.instr <= inst;
+    tb_h.cb.instr_valid <= 1'b1;
+    @(tb_h.cb);
+    // 3. De-assert
+    tb_h.cb.instr_valid <= 1'b0;
 
-  // main test sequence (CORRECTED)
+    // 4. Sample coverage right after instruction is sent
+    //    Flags will be updated on the WB state, so we sample again later
+    cg_op.sample();
+  endtask
+
+  // --- **NEW**: Helper task to load a register with a specific value
+  // Note: This assumes reg[0] is 0 (which it is at reset)
+  // It uses `LOAD rd, [r0 + addr]`
+  task automatic load_reg_via_mem(int reg_idx, logic [7:0] val, logic [7:0] addr);
+    bit [15:0] load_instr;
+
+    // 1. Set the memory value at the address we will read from
+    mem[addr] = val;
+
+    // 2. Create the LOAD instruction: opc=9, rd=reg_idx, rs=0, imm=addr
+    //    We can use our class for this!
+    if (!inst_item.randomize() with {
+          opc == 4'h9;  // LOAD
+          rd == reg_idx;
+          rs == 0;  // Use reg[0] as base
+          imm4 == addr;  // This is a 4-bit immediate, so we must use a low addr
+                         // Let's modify this to use addr[3:0]
+        }) begin
+      $error("Failed to randomize LOAD helper");
+      $finish;
+    end
+    load_instr = inst_item.get_instr();
+
+    // 3. Drive the instruction
+    $display("[%0t] Helper: Loading r%0d with %0d (from mem[%0h])", $time, reg_idx, val, addr);
+    drive_instr(load_instr);
+
+    // 4. Wait for the instruction to complete (IDLE->DEC->EXEC->MEM->WB)
+    //    This is critical. We must wait for the writeback.
+    repeat (5) @(tb_h.cb);
+    cg_fl.sample();  // Sample flags after it has time to write back
+  endtask
+
+
+  // main test sequence (MODIFIED)
   task automatic run_tests();
-    // **FIX**: All local variable declarations MUST go at the top of the task.
-    bit [15:0] inst;
-    bit [15:0] halt_instr;
-
     // wait for external reset deassertion
     wait (tb_h.rst_n == 1);
-
     // initialize memory
     for (int i = 0; i < 256; i++) mem[i] = $urandom_range(0, 255);
-
     // spawn memory model
     fork
       mem_model();
     join_none
 
-    // Construct the instruction item
+    // **NEW**: Construct the instruction item
     inst_item = new();
 
-    // issue randomized instruction stream until max count
+    // -----------------------------------------------------------------
+    // 1. RANDOM PHASE
+    // -----------------------------------------------------------------
     num_instructions = 500;
     $display("[%0t] Running %0d random instructions (HALT is constrained)...", $time,
              num_instructions);
 
     for (int i = 0; i < num_instructions; i++) begin
-
-
-      $display("%d valus", i);
-      // Randomize the class object
+      // **NEW**: Randomize the class object
       if (!inst_item.randomize()) begin
         $error("Randomization failed!");
         $finish;
       end
 
-      // This is now an assignment, not a declaration.
-      inst = inst_item.get_instr();
+      // **NEW**: Get the 16-bit instruction from the class
+      bit [15:0] inst = inst_item.get_instr();
+      // **NEW**: Use helper task to drive
+      drive_instr(inst);
 
-      // wait until CPU is ready to accept an instruction
-      do @(tb_h.cb); while (!tb_h.cb.instr_ready);
-
-      // drive instruction and valid for one clock
-      tb_h.cb.instr <= inst;  // Use the local 'inst' variable
-      tb_h.cb.instr_valid <= 1'b1;
-      @(tb_h.cb);
-      tb_h.cb.instr_valid <= 1'b0;
-
-      // sample coverage
-      cg_op.sample();
+      // sample coverage (flags)
       cg_fl.sample();
     end
 
-    // --- Directed HALT test ---
-    $display("[%0t] Random instructions complete. Sending directed HALT.", $time);
+    // -----------------------------------------------------------------
+    // 2. **NEW**: DIRECTED FLAG-COVERAGE PHASE
+    // -----------------------------------------------------------------
+    $display("[%0t] Random instructions complete. Running directed flag tests...", $time);
+
+    bit [15:0] alu_instr;
+
+    // --- Test 1: Force Zero (Z) flag (XOR r1, r1)
+    $display("[%0t] Flag Test: Forcing Zero flag (XOR r1, r1)", $time);
+    load_reg_via_mem(1, 8'hAA, 4'h1);  // Load r1 with non-zero
+    if (!inst_item.randomize() with {
+          opc == 4'h5;
+          rd == 1;
+          rs == 1;
+        })
+      $finish;  // XOR r1, r1
+    drive_instr(inst_item.get_instr());
+    repeat (4) @(tb_h.cb);
+    cg_fl.sample();  // Wait for WB
+
+    // --- Test 2: Force Carry (C) flag (SUB 10 - 20)
+    $display("[%0t] Flag Test: Forcing Carry/Borrow flag (SUB r1, r2)", $time);
+    load_reg_via_mem(1, 10, 4'h2);  // r1 = 10
+    load_reg_via_mem(2, 20, 4'h3);  // r2 = 20
+    if (!inst_item.randomize() with {
+          opc == 4'h2;
+          rd == 1;
+          rs == 2;
+        })
+      $finish;  // SUB r1, r2
+    drive_instr(inst_item.get_instr());
+    repeat (4) @(tb_h.cb);
+    cg_fl.sample();  // Wait for WB. Result -10 (F6). N=1, C=1.
+
+    // --- Test 3: Force Overflow (V) flag (ADD 100 + 100)
+    $display("[%0t] Flag Test: Forcing Overflow flag (ADD r1, r2)", $time);
+    load_reg_via_mem(1, 100, 4'h4);  // r1 = 100 (positive)
+    load_reg_via_mem(2, 100, 4'h5);  // r2 = 100 (positive)
+    if (!inst_item.randomize() with {
+          opc == 4'h1;
+          rd == 1;
+          rs == 2;
+        })
+      $finish;  // ADD r1, r2
+    drive_instr(inst_item.get_instr());
+    repeat (4) @(tb_h.cb);
+    cg_fl.sample();  // Wait for WB. Result 200 (C8). N=1, C=0. V=1.
+
+    // --- Test 4: Force Negative (N) flag (ADD 100 + 20)
+    $display("[%0t] Flag Test: Forcing Negative flag (ADD r1, r2)", $time);
+    load_reg_via_mem(1, 100, 4'h6);  // r1 = 100
+    load_reg_via_mem(2, 50, 4'h7);  // r2 = 50
+    if (!inst_item.randomize() with {
+          opc == 4'h1;
+          rd == 1;
+          rs == 2;
+        })
+      $finish;  // ADD r1, r2
+    drive_instr(inst_item.get_instr());
+    repeat (4) @(tb_h.cb);
+    cg_fl.sample();  // Wait for WB. Result 150 (96). N=1. V=0. C=0.
+
+    // -----------------------------------------------------------------
+    // 3. DIRECTED HALT TEST (Original)
+    // -----------------------------------------------------------------
+    $display("[%0t] Directed flag tests complete. Sending directed HALT.", $time);
 
     // 1. Turn off the no_halt constraint
     inst_item.no_halt.constraint_mode(0);
-
     // 2. Randomize again, forcing opc to be HALT
     if (!inst_item.randomize() with {opc == 4'hF;}) begin
       $error("HALT instruction randomization failed!");
       $finish;
     end
 
-    // This is now an assignment, not a declaration.
-    halt_instr = inst_item.get_instr();  // This will be 16'hF...
-
-    // 3. Wait and drive the HALT instruction
-    do @(tb_h.cb); while (!tb_h.cb.instr_ready);
-    tb_h.cb.instr <= halt_instr;  // Use the local 'halt_instr' variable
-    tb_h.cb.instr_valid <= 1'b1;
-    @(tb_h.cb);
-    tb_h.cb.instr_valid <= 1'b0;
+    bit [15:0] halt_instr = inst_item.get_instr();
+    // 3. Drive the HALT instruction
+    drive_instr(halt_instr);
 
     // 4. Wait for the CPU to signal 'done'
     do @(tb_h.cb); while (!tb_h.cb.done);
 
     $display("[%0t] HALT observed.", $time);
-
     // 5. Sample coverage one last time to get the HALT bin
     cg_op.sample();
     cg_fl.sample();
-
     // allow final cycles to settle
     repeat (10) @(tb_h.cb);
 
